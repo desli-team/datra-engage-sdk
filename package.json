@@ -1,0 +1,33 @@
+{
+  "name": "@datra/engage-sdk",
+  "version": "0.1.0",
+  "description": "Datra Engage JavaScript SDK for resolving and tracking in-app messages.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "datra",
+    "engage",
+    "in-app",
+    "sdk"
+  ],
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
