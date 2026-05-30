@@ -52,6 +52,19 @@ export type EngageFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+export interface DatraEngageRetryConfig {
+  retries?: number;
+  retryDelayMs?: number;
+  maxRetryDelayMs?: number;
+  retryStatuses?: number[];
+}
+
+export interface DatraEngageErrorContext {
+  path: string;
+  attempt: number;
+  retryable: boolean;
+}
+
 export interface DatraEngageConfig {
   baseUrl: string;
   publicKey: string;
@@ -62,6 +75,9 @@ export interface DatraEngageConfig {
   locale?: string;
   defaultContext?: Record<string, unknown>;
   fetchImpl?: EngageFetch;
+  timeoutMs?: number;
+  retry?: DatraEngageRetryConfig | number;
+  onError?: (error: unknown, context: DatraEngageErrorContext) => void;
 }
 
 export interface DatraEngageIdentity {
@@ -105,4 +121,16 @@ export interface TrackEventOptions {
   customerExternalId?: string;
   idempotencyKey?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface TrackBatchEventOptions {
+  customerExternalId?: string;
+  idempotencyKeyPrefix?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SafeTrackEventResult {
+  accepted: boolean;
+  response?: TrackEngageEventResponse;
+  error?: unknown;
 }

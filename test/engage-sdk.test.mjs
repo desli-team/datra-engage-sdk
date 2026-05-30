@@ -128,3 +128,108 @@ test("request errors include status and response body", async () => {
     },
   );
 });
+
+test("request timeout throws DatraEngageError", async () => {
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    retry: 0,
+    timeoutMs: 1,
+    fetchImpl: async (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        });
+      }),
+  });
+
+  await assert.rejects(
+    () => sdk.getMessages({ placement: "home" }),
+    (error) => {
+      assert.equal(error instanceof DatraEngageError, true);
+      assert.equal(error.status, 0);
+      assert.deepEqual(error.body, {
+        code: "TIMEOUT",
+        timeoutMs: 1,
+      });
+      return true;
+    },
+  );
+});
+
+test("retries retryable response statuses", async () => {
+  let calls = 0;
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    retry: {
+      retries: 2,
+      retryDelayMs: 1,
+    },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return createJsonResponse({ message: "temporary" }, 503);
+      }
+      return createJsonResponse({ messages: [] });
+    },
+  });
+
+  const result = await sdk.getMessages({ placement: "home" });
+
+  assert.deepEqual(result, { messages: [] });
+  assert.equal(calls, 2);
+});
+
+test("safe tracking keeps app flow alive on errors", async () => {
+  const errors = [];
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    retry: 0,
+    onError: (error, context) => errors.push({ error, context }),
+    fetchImpl: async () => createJsonResponse({ message: "server down" }, 500),
+  });
+
+  const result = await sdk.messageShownSafe("decision_1");
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.error instanceof DatraEngageError, true);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].context.path, "/engage/events");
+  assert.equal(errors[0].context.retryable, true);
+});
+
+test("trackShown marks every resolved message with safe calls", async () => {
+  const bodies = [];
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return createJsonResponse({
+        id: `event_${bodies.length}`,
+        decisionId: `decision_${bodies.length}`,
+        eventType: "SHOWN",
+        accepted: true,
+      });
+    },
+  });
+
+  const result = await sdk.trackShown([
+    { decisionId: "decision_1" },
+    { decisionId: "decision_2" },
+  ], {
+    idempotencyKeyPrefix: "home",
+  });
+
+  assert.equal(result.length, 2);
+  assert.equal(result[0].accepted, true);
+  assert.deepEqual(bodies.map((body) => body.decisionId), ["decision_1", "decision_2"]);
+  assert.deepEqual(bodies.map((body) => body.idempotencyKey), [
+    "home:shown:decision_1",
+    "home:shown:decision_2",
+  ]);
+});
