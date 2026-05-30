@@ -1,6 +1,6 @@
 {
   "name": "@datra/engage-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Datra Engage JavaScript SDK for resolving and tracking in-app messages.",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,7 +13,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -28,7 +29,7 @@
     "in-app",
     "sdk"
   ],
-  "license": "UNLICENSED",
+  "license": "MIT",
   "devDependencies": {
     "typescript": "^5.7.2"
   }
