@@ -1,4 +1,22 @@
-# Datra Engage SDK
+<p align="center">
+  <a href="https://datra.uz">
+    <img src="./assets/datra-logo.png" alt="Datra" width="72" />
+  </a>
+</p>
+
+<h1 align="center">Datra Engage SDK</h1>
+
+<p align="center">
+  Show personalized in-app messages, promotions, coupons and engagement mechanics powered by Datra.
+</p>
+
+<p align="center">
+  <a href="https://api.datra.uz/redoc">Documentation</a>
+  ·
+  <a href="https://www.npmjs.com/package/@datra/engage-sdk">npm package</a>
+  ·
+  <a href="https://datra.uz">Datra website</a>
+</p>
 
 **Datra Engage SDK** helps apps show personalized in-app messages, promotions, coupons and engagement mechanics powered by Datra.
 
@@ -475,3 +493,15 @@ Datra Engage is not just a message delivery SDK.
 It is a bridge between customer data and real customer action.
 
 Use it to turn app screens into personalized engagement moments.
+
+---
+
+<p align="center">
+  <a href="https://datra.uz">
+    <img src="./assets/datra-logo.png" alt="Datra" width="44" />
+  </a>
+</p>
+
+<p align="center">
+  Built by <a href="https://datra.uz">Datra</a>. Read the full <a href="https://api.datra.uz/redoc">Datra API documentation</a>.
+</p>
