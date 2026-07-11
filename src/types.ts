@@ -9,13 +9,33 @@ export type EngageMessageType =
 
 export type EngageEventType = "SHOWN" | "CLICKED" | "DISMISSED" | "CONVERTED";
 
+export type EngageActionType =
+  | "NONE"
+  | "OPEN_SCREEN"
+  | "OPEN_PROMOTION"
+  | "OPEN_COUPON"
+  | "OPEN_PRODUCT"
+  | "OPEN_CART"
+  | "OPEN_URL"
+  | "OPEN_STORY"
+  | "OPEN_MECHANIC";
+
 export interface EngageCta {
   text?: string;
+  label?: string;
   [key: string]: unknown;
 }
 
 export interface EngageAction {
-  type?: string;
+  type?: EngageActionType | string;
+  screen?: string;
+  promotionId?: string;
+  couponId?: string;
+  productId?: string;
+  cartId?: string;
+  url?: string;
+  storyId?: string;
+  mechanicId?: string;
   [key: string]: unknown;
 }
 
@@ -35,6 +55,51 @@ export interface EngageResolvedMessage {
   offer?: Record<string, unknown>;
   tracking?: Record<string, unknown>;
 }
+
+export interface DatraEngageActionHandlers {
+  onOpenScreen?: (
+    screen: string,
+    action: EngageAction,
+    message?: EngageResolvedMessage,
+  ) => void | Promise<void>;
+  onOpenPromotion?: (
+    promotionId: string,
+    action: EngageAction,
+    message?: EngageResolvedMessage,
+  ) => void | Promise<void>;
+  onOpenCoupon?: (
+    couponId: string,
+    action: EngageAction,
+    message?: EngageResolvedMessage,
+  ) => void | Promise<void>;
+  onOpenProduct?: (
+    productId: string,
+    action: EngageAction,
+    message?: EngageResolvedMessage,
+  ) => void | Promise<void>;
+  onOpenCart?: (action: EngageAction, message?: EngageResolvedMessage) => void | Promise<void>;
+  onOpenUrl?: (
+    url: string,
+    action: EngageAction,
+    message?: EngageResolvedMessage,
+  ) => void | Promise<void>;
+  onOpenStory?: (
+    storyId: string,
+    action: EngageAction,
+    message?: EngageResolvedMessage,
+  ) => void | Promise<void>;
+  onOpenMechanic?: (
+    mechanicId: string,
+    action: EngageAction,
+    message?: EngageResolvedMessage,
+  ) => void | Promise<void>;
+  onUnhandledAction?: (action: EngageAction, message?: EngageResolvedMessage) => void | Promise<void>;
+}
+
+export type DatraEngageActionHandler = (
+  action?: EngageAction | null,
+  message?: EngageResolvedMessage,
+) => Promise<void>;
 
 export interface ResolveEngageMessagesResponse {
   messages: EngageResolvedMessage[];
@@ -65,6 +130,27 @@ export interface DatraEngageErrorContext {
   retryable: boolean;
 }
 
+export interface DatraEngageStorage {
+  getItem(key: string): string | null | Promise<string | null>;
+  setItem(key: string, value: string): void | Promise<void>;
+  removeItem(key: string): void | Promise<void>;
+}
+
+export interface DatraEngageEventQueueConfig {
+  enabled?: boolean;
+  storage?: DatraEngageStorage;
+  storageKey?: string;
+  maxEvents?: number;
+}
+
+export interface DatraEngageDedupeConfig {
+  enabled?: boolean;
+  storage?: DatraEngageStorage;
+  storageKey?: string;
+  ttlMs?: number;
+  maxKeys?: number;
+}
+
 export interface DatraEngageConfig {
   baseUrl: string;
   publicKey: string;
@@ -77,6 +163,8 @@ export interface DatraEngageConfig {
   fetchImpl?: EngageFetch;
   timeoutMs?: number;
   retry?: DatraEngageRetryConfig | number;
+  eventQueue?: boolean | DatraEngageEventQueueConfig;
+  dedupe?: boolean | DatraEngageDedupeConfig;
   onError?: (error: unknown, context: DatraEngageErrorContext) => void;
 }
 
@@ -133,4 +221,21 @@ export interface SafeTrackEventResult {
   accepted: boolean;
   response?: TrackEngageEventResponse;
   error?: unknown;
+  queued?: boolean;
+  deduped?: boolean;
+}
+
+export interface QueuedEngageEvent {
+  id: string;
+  input: TrackEventInput;
+  createdAt: string;
+  attempts: number;
+  lastError?: string;
+}
+
+export interface FlushEngageEventQueueResult {
+  attempted: number;
+  sent: number;
+  failed: number;
+  remaining: number;
 }

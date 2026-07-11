@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { DatraEngage, DatraEngageError } from "../dist/index.js";
+import {
+  DatraEngage,
+  DatraEngageError,
+  createDatraEngageActionHandler,
+  createMemoryStorageAdapter,
+} from "../dist/index.js";
 
 function createJsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -111,6 +116,27 @@ test("tracking helpers send expected event payload", async () => {
   });
 });
 
+test("tracking helpers add default idempotency keys", async () => {
+  const bodies = [];
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return createJsonResponse({
+        id: "event_1",
+        decisionId: "decision_1",
+        eventType: "SHOWN",
+        accepted: true,
+      });
+    },
+  });
+
+  await sdk.messageShown("decision_1");
+
+  assert.equal(bodies[0].idempotencyKey, "datra:shown:decision_1");
+});
+
 test("request errors include status and response body", async () => {
   const sdk = new DatraEngage({
     baseUrl: "https://api.datra.uz",
@@ -202,6 +228,80 @@ test("safe tracking keeps app flow alive on errors", async () => {
   assert.equal(errors[0].context.retryable, true);
 });
 
+test("safe tracking deduplicates repeated UI events", async () => {
+  let calls = 0;
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    fetchImpl: async () => {
+      calls += 1;
+      return createJsonResponse({
+        id: "event_1",
+        decisionId: "decision_1",
+        eventType: "SHOWN",
+        accepted: true,
+      });
+    },
+  });
+
+  const first = await sdk.messageShownSafe("decision_1");
+  const second = await sdk.messageShownSafe("decision_1");
+
+  assert.equal(first.accepted, true);
+  assert.equal(second.accepted, true);
+  assert.equal(second.deduped, true);
+  assert.equal(calls, 1);
+});
+
+test("safe tracking can queue retryable failures and flush later", async () => {
+  let online = false;
+  const bodies = [];
+  const storage = createMemoryStorageAdapter();
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    retry: 0,
+    eventQueue: {
+      enabled: true,
+      storage,
+    },
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      if (!online) {
+        return createJsonResponse({ message: "temporary" }, 503);
+      }
+
+      return createJsonResponse({
+        id: "event_1",
+        decisionId: "decision_1",
+        eventType: "CLICKED",
+        accepted: true,
+      });
+    },
+  });
+
+  const queued = await sdk.messageClickedSafe("decision_1");
+
+  assert.equal(queued.accepted, false);
+  assert.equal(queued.queued, true);
+  assert.equal(await sdk.getQueuedEventCount(), 1);
+
+  online = true;
+  const flushed = await sdk.flushEventQueue();
+
+  assert.deepEqual(flushed, {
+    attempted: 1,
+    sent: 1,
+    failed: 0,
+    remaining: 0,
+  });
+  assert.equal(await sdk.getQueuedEventCount(), 0);
+  assert.deepEqual(bodies.map((body) => body.idempotencyKey), [
+    "datra:clicked:decision_1",
+    "datra:clicked:decision_1",
+  ]);
+});
+
 test("trackShown marks every resolved message with safe calls", async () => {
   const bodies = [];
   const sdk = new DatraEngage({
@@ -232,4 +332,39 @@ test("trackShown marks every resolved message with safe calls", async () => {
     "home:shown:decision_1",
     "home:shown:decision_2",
   ]);
+});
+
+test("action handler dispatches typed Datra actions", async () => {
+  const calls = [];
+  const handler = createDatraEngageActionHandler({
+    onOpenPromotion: async (promotionId) => {
+      calls.push(["promotion", promotionId]);
+    },
+    onOpenCart: async () => {
+      calls.push(["cart"]);
+    },
+    onUnhandledAction: async (action) => {
+      calls.push(["unhandled", action.type]);
+    },
+  });
+
+  await handler({ type: "OPEN_PROMOTION", promotionId: "promotion_1" });
+  await handler({ type: "OPEN_CART" });
+  await handler({ type: "OPEN_UNKNOWN" });
+
+  assert.deepEqual(calls, [
+    ["promotion", "promotion_1"],
+    ["cart"],
+    ["unhandled", "OPEN_UNKNOWN"],
+  ]);
+});
+
+test("react subpath exports integration helpers", async () => {
+  const reactSdk = await import("../dist/react.js");
+
+  assert.equal(typeof reactSdk.DatraEngageProvider, "function");
+  assert.equal(typeof reactSdk.useDatraEngage, "function");
+  assert.equal(typeof reactSdk.useEngageMessages, "function");
+  assert.equal(typeof reactSdk.useDatraEngageActionHandler, "function");
+  assert.equal(typeof reactSdk.createDatraEngageActionHandler, "function");
 });

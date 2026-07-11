@@ -7,22 +7,31 @@
 <h1 align="center">Datra Engage SDK</h1>
 
 <p align="center">
-  Show personalized in-app messages, promotions, coupons and engagement mechanics powered by Datra.
+  Official JavaScript and TypeScript SDK for personalized in-app messages, promotions, coupons and engagement mechanics powered by Datra.
 </p>
 
 <p align="center">
-  <a href="https://api.datra.uz/redoc">Documentation</a>
+  <a href="https://datra.uz">Website</a>
+  ·
+  <a href="https://api.datra.uz/redoc">API documentation</a>
   ·
   <a href="https://www.npmjs.com/package/@datra/engage-sdk">npm package</a>
   ·
-  <a href="https://datra.uz">Datra website</a>
+  <a href="https://github.com/desli-team/datra-engage-sdk">GitHub</a>
 </p>
 
-**Datra Engage SDK** helps apps show personalized in-app messages, promotions, coupons and engagement mechanics powered by Datra.
+**Datra Engage SDK** helps web apps, mobile apps, React Native apps and embedded client experiences show personalized in-app messages powered by Datra.
 
-It is designed for mobile apps, web apps and embedded client experiences where marketing and product teams need to show the right message to the right customer at the right moment.
+Use it when marketing and product teams need to show the right message to the right customer at the right moment without hardcoding every campaign into the application.
 
 Datra Engage is part of the Datra Customer Engagement Platform.
+
+## Links
+
+- Website: [datra.uz](https://datra.uz)
+- API documentation: [api.datra.uz/redoc](https://api.datra.uz/redoc)
+- npm: [@datra/engage-sdk](https://www.npmjs.com/package/@datra/engage-sdk)
+- GitHub: [desli-team/datra-engage-sdk](https://github.com/desli-team/datra-engage-sdk)
 
 ---
 
@@ -48,6 +57,22 @@ Your app decides **how it should look**.
 
 ---
 
+## Supported message types
+
+The SDK supports the same message types as Datra Engage API:
+
+| Type | Typical use |
+| --- | --- |
+| `BANNER` | Home screen promo, category offer, campaign strip |
+| `POPUP` | Important one-time offer or announcement |
+| `BOTTOM_SHEET` | Cart, checkout or coupon reminder |
+| `COUPON_CARD` | Active coupon, gift or personal offer |
+| `INLINE_BLOCK` | Embedded block inside profile, checkout or loyalty screens |
+| `CAROUSEL` | Multiple offers in one placement |
+| `STORY` | Story-like marketing or gamification entry point |
+
+---
+
 ## What this SDK does
 
 The SDK can:
@@ -61,6 +86,8 @@ The SDK can:
 - track conversions
 - work safely in non-blocking UI flows
 - retry temporary failed requests
+- queue failed tracking events
+- deduplicate UI tracking events
 
 ---
 
@@ -204,8 +231,8 @@ Example message:
     "text": "Заказать"
   },
   "action": {
-    "type": "OPEN_OFFER",
-    "offerId": "offer_123"
+    "type": "OPEN_PROMOTION",
+    "promotionId": "promotion_123"
   }
 }
 ```
@@ -260,8 +287,90 @@ Safe methods return:
   accepted: boolean;
   response?: unknown;
   error?: unknown;
+  queued?: boolean;
+  deduped?: boolean;
 }
 ```
+
+---
+
+## Action Contract
+
+Messages can include an `action` object. The SDK does not execute actions automatically because each app owns its navigation.
+
+Recommended action types:
+
+```ts
+"OPEN_SCREEN"
+"OPEN_PROMOTION"
+"OPEN_COUPON"
+"OPEN_PRODUCT"
+"OPEN_CART"
+"OPEN_URL"
+"OPEN_STORY"
+"OPEN_MECHANIC"
+```
+
+Use the action handler helper to keep app navigation consistent:
+
+```ts
+import { createDatraEngageActionHandler } from "@datra/engage-sdk";
+
+const handleDatraAction = createDatraEngageActionHandler({
+  onOpenPromotion: async (promotionId) => {
+    navigation.navigate("Promotion", { promotionId });
+  },
+  onOpenCoupon: async (couponId) => {
+    navigation.navigate("Coupon", { couponId });
+  },
+  onOpenCart: async () => {
+    navigation.navigate("Cart");
+  },
+  onUnhandledAction: async (action) => {
+    console.warn("Unhandled Datra action", action);
+  },
+});
+```
+
+---
+
+## Offline Queue and Dedupe
+
+Safe tracking can queue temporary failures and flush them later.
+
+```ts
+import { DatraEngage, createWebStorageAdapter } from "@datra/engage-sdk";
+
+const storage = createWebStorageAdapter(window.localStorage, "my-app:");
+
+const engage = new DatraEngage({
+  baseUrl: "https://api.datra.uz",
+  publicKey: "pk_live_xxx",
+  eventQueue: {
+    enabled: true,
+    storage,
+  },
+  dedupe: {
+    enabled: true,
+    storage,
+  },
+});
+
+await engage.flushEventQueue();
+await engage.messageShownSafe("decision_id");
+```
+
+For React Native, pass an adapter backed by your storage library, for example AsyncStorage:
+
+```ts
+const asyncStorageAdapter = {
+  getItem: (key: string) => AsyncStorage.getItem(key),
+  setItem: (key: string, value: string) => AsyncStorage.setItem(key, value),
+  removeItem: (key: string) => AsyncStorage.removeItem(key),
+};
+```
+
+Dedupe is enabled by default for safe tracking. Event queue is opt-in so apps can choose where queued events are stored.
 
 ---
 
@@ -284,11 +393,11 @@ engage.identify({
 
 ---
 
-## React Native Example
+## React Native and Expo
 
 ```tsx
-import { useEffect, useState } from "react";
-import { DatraEngage, type EngageResolvedMessage } from "@datra/engage-sdk";
+import { DatraEngage } from "@datra/engage-sdk";
+import { DatraEngageProvider, useEngageMessages } from "@datra/engage-sdk/react";
 
 const engage = new DatraEngage({
   baseUrl: "https://api.datra.uz",
@@ -297,43 +406,38 @@ const engage = new DatraEngage({
   appVersion: "1.5.0",
 });
 
-export function HomeScreen({
-  customerExternalId,
-}: {
-  customerExternalId: string;
-}) {
-  const [messages, setMessages] = useState<EngageResolvedMessage[]>([]);
+export function App() {
+  return (
+    <DatraEngageProvider client={engage}>
+      <HomeScreen customerExternalId="customer_123" />
+    </DatraEngageProvider>
+  );
+}
 
-  useEffect(() => {
-    engage.identify({ customerExternalId });
+function HomeScreen({ customerExternalId }: { customerExternalId: string }) {
+  const { messages, isLoading, refresh } = useEngageMessages("home", {
+    placement: "home_top_banner",
+    customerExternalId,
+    trackShown: {
+      idempotencyKeyPrefix: `home:${customerExternalId}`,
+    },
+  });
 
-    let mounted = true;
+  if (isLoading || messages.length === 0) {
+    return null;
+  }
 
-    engage
-      .screenViewed("home", {
-        placement: "home_top_banner",
-      })
-      .then(async (response) => {
-        if (!mounted) return;
-
-        setMessages(response.messages);
-
-        await engage.trackShown(response.messages, {
-          idempotencyKeyPrefix: "home",
-        });
-      })
-      .catch(() => {
-        if (mounted) setMessages([]);
-      });
-
-    return () => {
-      mounted = false;
-    };
-  }, [customerExternalId]);
-
-  return <>{messages.map((message) => renderInAppMessage(message))}</>;
+  return renderInAppMessage(messages[0], { refresh });
 }
 ```
+
+React is an optional peer dependency. The core SDK does not import React unless you use `@datra/engage-sdk/react`.
+
+More examples:
+
+- `examples/react-native-home-screen.tsx`
+- `examples/web-home.ts`
+- `examples/hoty-dogy-action-handler.ts`
 
 ---
 

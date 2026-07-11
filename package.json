@@ -1,7 +1,7 @@
 {
   "name": "@datra/engage-sdk",
-  "version": "0.1.1",
-  "description": "Datra Engage JavaScript SDK for resolving and tracking in-app messages.",
+  "version": "0.2.0",
+  "description": "Official JavaScript and TypeScript SDK for Datra Engage in-app messages, promotions, coupons, and customer engagement tracking.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,14 +9,30 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js"
     }
   },
   "files": [
     "assets",
     "dist",
+    "examples",
     "README.md",
     "LICENSE"
   ],
+  "homepage": "https://datra.uz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/desli-team/datra-engage-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/desli-team/datra-engage-sdk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -28,10 +44,30 @@
     "datra",
     "engage",
     "in-app",
+    "in-app-messaging",
+    "customer-engagement",
+    "promotions",
+    "coupons",
+    "loyalty",
+    "retention",
+    "react-native",
+    "typescript",
     "sdk"
   ],
+  "sideEffects": false,
+  "author": "Datra",
   "license": "MIT",
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@types/react": "^19.2.16",
+    "react": "^19.2.7",
     "typescript": "^5.7.2"
   }
 }

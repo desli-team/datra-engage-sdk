@@ -2,11 +2,19 @@ export * from "./types.js";
 
 import type {
   DatraEngageConfig,
+  DatraEngageDedupeConfig,
   DatraEngageIdentity,
+  DatraEngageEventQueueConfig,
   DatraEngageRetryConfig,
+  DatraEngageStorage,
+  DatraEngageActionHandlers,
+  DatraEngageActionHandler,
+  EngageAction,
   EngageEventType,
   EngageFetch,
   EngageResolvedMessage,
+  FlushEngageEventQueueResult,
+  QueuedEngageEvent,
   ResolveEngageMessagesResponse,
   ResolveMessagesInput,
   SafeTrackEventResult,
@@ -23,6 +31,26 @@ const DEFAULT_RETRY_CONFIG: Required<DatraEngageRetryConfig> = {
   retryDelayMs: 250,
   maxRetryDelayMs: 1500,
   retryStatuses: [408, 429, 500, 502, 503, 504],
+};
+const DEFAULT_EVENT_QUEUE_STORAGE_KEY = "datra:engage:event-queue";
+const DEFAULT_EVENT_QUEUE_MAX_EVENTS = 100;
+const DEFAULT_DEDUPE_STORAGE_KEY = "datra:engage:dedupe";
+const DEFAULT_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_DEDUPE_MAX_KEYS = 500;
+
+type NormalizedEventQueueConfig = {
+  enabled: boolean;
+  storage: DatraEngageStorage;
+  storageKey: string;
+  maxEvents: number;
+};
+
+type NormalizedDedupeConfig = {
+  enabled: boolean;
+  storage: DatraEngageStorage;
+  storageKey: string;
+  ttlMs: number;
+  maxKeys: number;
 };
 
 export class DatraEngageError extends Error {
@@ -44,7 +72,10 @@ export class DatraEngage {
   private readonly fetchImpl: EngageFetch;
   private readonly timeoutMs: number;
   private readonly retryConfig: Required<DatraEngageRetryConfig>;
+  private readonly eventQueueConfig: NormalizedEventQueueConfig;
+  private readonly dedupeConfig: NormalizedDedupeConfig;
   private readonly onError?: DatraEngageConfig["onError"];
+  private readonly inFlightDedupeKeys = new Set<string>();
   private customerExternalId?: string;
   private platform?: string;
   private appVersion?: string;
@@ -70,6 +101,8 @@ export class DatraEngage {
     this.fetchImpl = fetchImpl;
     this.timeoutMs = normalizePositiveNumber(config.timeoutMs, DEFAULT_TIMEOUT_MS);
     this.retryConfig = normalizeRetryConfig(config.retry);
+    this.eventQueueConfig = normalizeEventQueueConfig(config.eventQueue);
+    this.dedupeConfig = normalizeDedupeConfig(config.dedupe);
     this.onError = config.onError;
     this.customerExternalId = normalizeOptionalString(config.customerExternalId);
     this.platform = normalizeOptionalString(config.platform);
@@ -135,17 +168,14 @@ export class DatraEngage {
   }
 
   async trackEvent(input: TrackEventInput): Promise<TrackEngageEventResponse> {
-    const decisionId = input.decisionId.trim();
-    if (!decisionId) {
-      throw new Error("decisionId is required");
-    }
+    const normalized = this.normalizeTrackEventInput(input);
 
     return this.request<TrackEngageEventResponse>("/engage/events", {
-      decisionId,
-      eventType: input.eventType,
-      customerExternalId: normalizeOptionalString(input.customerExternalId) ?? this.customerExternalId,
-      idempotencyKey: normalizeOptionalString(input.idempotencyKey),
-      metadata: input.metadata,
+      decisionId: normalized.decisionId,
+      eventType: normalized.eventType,
+      customerExternalId: normalized.customerExternalId,
+      idempotencyKey: normalized.idempotencyKey,
+      metadata: normalized.metadata,
     });
   }
 
@@ -166,17 +196,33 @@ export class DatraEngage {
   }
 
   async trackEventSafe(input: TrackEventInput): Promise<SafeTrackEventResult> {
+    const normalized = this.normalizeTrackEventInput(input);
+    const dedupeKey = createEventDedupeKey(normalized);
+
+    if (this.inFlightDedupeKeys.has(dedupeKey) || await this.hasDedupeKey(dedupeKey)) {
+      return {
+        accepted: true,
+        deduped: true,
+      };
+    }
+
+    this.inFlightDedupeKeys.add(dedupeKey);
     try {
-      const response = await this.trackEvent(input);
+      const response = await this.trackEvent(normalized);
+      await this.markDedupeKey(dedupeKey);
       return {
         accepted: response.accepted,
         response,
       };
     } catch (error) {
+      const queued = await this.queueTrackEventIfRetryable(normalized, error);
       return {
         accepted: false,
         error,
+        queued,
       };
+    } finally {
+      this.inFlightDedupeKeys.delete(dedupeKey);
     }
   }
 
@@ -213,6 +259,65 @@ export class DatraEngage {
     return results;
   }
 
+  async flushEventQueue(): Promise<FlushEngageEventQueueResult> {
+    if (!this.eventQueueConfig.enabled) {
+      return {
+        attempted: 0,
+        sent: 0,
+        failed: 0,
+        remaining: 0,
+      };
+    }
+
+    const queued = await this.readQueuedEvents();
+    const remaining: QueuedEngageEvent[] = [];
+    let sent = 0;
+    let failed = 0;
+
+    for (const item of queued) {
+      try {
+        await this.trackEvent(item.input);
+        await this.markDedupeKey(createEventDedupeKey(this.normalizeTrackEventInput(item.input)));
+        sent += 1;
+      } catch (error) {
+        failed += 1;
+        if (isRetryableError(error, this.retryConfig.retryStatuses)) {
+          remaining.push({
+            ...item,
+            attempts: item.attempts + 1,
+            lastError: stringifyError(error),
+          });
+        }
+      }
+    }
+
+    await this.writeQueuedEvents(remaining);
+
+    return {
+      attempted: queued.length,
+      sent,
+      failed,
+      remaining: remaining.length,
+    };
+  }
+
+  async getQueuedEventCount() {
+    if (!this.eventQueueConfig.enabled) {
+      return 0;
+    }
+
+    const queued = await this.readQueuedEvents();
+    return queued.length;
+  }
+
+  async clearEventQueue() {
+    if (!this.eventQueueConfig.enabled) {
+      return;
+    }
+
+    await this.eventQueueConfig.storage.removeItem(this.eventQueueConfig.storageKey);
+  }
+
   private trackMessageEvent(
     decisionId: string,
     eventType: EngageEventType,
@@ -239,6 +344,138 @@ export class DatraEngage {
       idempotencyKey: options.idempotencyKey,
       metadata: options.metadata,
     });
+  }
+
+  private normalizeTrackEventInput(input: TrackEventInput): TrackEventInput {
+    const decisionId = input.decisionId.trim();
+    if (!decisionId) {
+      throw new Error("decisionId is required");
+    }
+
+    return {
+      decisionId,
+      eventType: input.eventType,
+      customerExternalId: normalizeOptionalString(input.customerExternalId) ?? this.customerExternalId,
+      idempotencyKey: normalizeOptionalString(input.idempotencyKey)
+        ?? createDefaultIdempotencyKey(decisionId, input.eventType),
+      metadata: input.metadata,
+    };
+  }
+
+  private async queueTrackEventIfRetryable(input: TrackEventInput, error: unknown) {
+    if (!this.eventQueueConfig.enabled || !isRetryableError(error, this.retryConfig.retryStatuses)) {
+      return false;
+    }
+
+    try {
+      const queued = await this.readQueuedEvents();
+      const idempotencyKey = normalizeOptionalString(input.idempotencyKey);
+      if (idempotencyKey && queued.some((item) => item.input.idempotencyKey === idempotencyKey)) {
+        return true;
+      }
+
+      queued.push({
+        id: createQueueEventId(),
+        input,
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+        lastError: stringifyError(error),
+      });
+
+      await this.writeQueuedEvents(queued.slice(-this.eventQueueConfig.maxEvents));
+      return true;
+    } catch (queueError) {
+      this.onError?.(queueError, {
+        path: "/engage/events/queue",
+        attempt: 1,
+        retryable: false,
+      });
+      return false;
+    }
+  }
+
+  private async readQueuedEvents(): Promise<QueuedEngageEvent[]> {
+    try {
+      const raw = await this.eventQueueConfig.storage.getItem(this.eventQueueConfig.storageKey);
+      if (!raw) {
+        return [];
+      }
+
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+
+      return parsed.filter(isQueuedEngageEvent);
+    } catch {
+      return [];
+    }
+  }
+
+  private async writeQueuedEvents(events: QueuedEngageEvent[]) {
+    await this.eventQueueConfig.storage.setItem(
+      this.eventQueueConfig.storageKey,
+      JSON.stringify(events),
+    );
+  }
+
+  private async hasDedupeKey(key: string) {
+    if (!this.dedupeConfig.enabled) {
+      return false;
+    }
+
+    const entries = await this.readDedupeEntries();
+    const createdAt = entries[key];
+    if (!createdAt) {
+      return false;
+    }
+
+    if (Date.now() - createdAt > this.dedupeConfig.ttlMs) {
+      delete entries[key];
+      await this.writeDedupeEntries(entries);
+      return false;
+    }
+
+    return true;
+  }
+
+  private async markDedupeKey(key: string) {
+    if (!this.dedupeConfig.enabled) {
+      return;
+    }
+
+    const entries = await this.readDedupeEntries();
+    entries[key] = Date.now();
+    await this.writeDedupeEntries(trimDedupeEntries(entries, this.dedupeConfig.maxKeys));
+  }
+
+  private async readDedupeEntries(): Promise<Record<string, number>> {
+    try {
+      const raw = await this.dedupeConfig.storage.getItem(this.dedupeConfig.storageKey);
+      if (!raw) {
+        return {};
+      }
+
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+
+      return Object.fromEntries(
+        Object.entries(parsed).filter((entry): entry is [string, number] =>
+          typeof entry[0] === "string" && typeof entry[1] === "number",
+        ),
+      );
+    } catch {
+      return {};
+    }
+  }
+
+  private async writeDedupeEntries(entries: Record<string, number>) {
+    await this.dedupeConfig.storage.setItem(
+      this.dedupeConfig.storageKey,
+      JSON.stringify(entries),
+    );
   }
 
   private async request<T>(path: string, body: Record<string, unknown>): Promise<T> {
@@ -344,6 +581,50 @@ function normalizeRetryConfig(value: DatraEngageRetryConfig | number | undefined
   };
 }
 
+function normalizeEventQueueConfig(
+  value: boolean | DatraEngageEventQueueConfig | undefined,
+): NormalizedEventQueueConfig {
+  if (value === false) {
+    return {
+      enabled: false,
+      storage: createMemoryStorageAdapter(),
+      storageKey: DEFAULT_EVENT_QUEUE_STORAGE_KEY,
+      maxEvents: DEFAULT_EVENT_QUEUE_MAX_EVENTS,
+    };
+  }
+
+  const config = typeof value === "object" ? value : {};
+  return {
+    enabled: config.enabled ?? value === true,
+    storage: config.storage ?? createMemoryStorageAdapter(),
+    storageKey: config.storageKey?.trim() || DEFAULT_EVENT_QUEUE_STORAGE_KEY,
+    maxEvents: normalizePositiveNumber(config.maxEvents, DEFAULT_EVENT_QUEUE_MAX_EVENTS),
+  };
+}
+
+function normalizeDedupeConfig(
+  value: boolean | DatraEngageDedupeConfig | undefined,
+): NormalizedDedupeConfig {
+  if (value === false) {
+    return {
+      enabled: false,
+      storage: createMemoryStorageAdapter(),
+      storageKey: DEFAULT_DEDUPE_STORAGE_KEY,
+      ttlMs: DEFAULT_DEDUPE_TTL_MS,
+      maxKeys: DEFAULT_DEDUPE_MAX_KEYS,
+    };
+  }
+
+  const config = typeof value === "object" ? value : {};
+  return {
+    enabled: config.enabled ?? true,
+    storage: config.storage ?? createMemoryStorageAdapter(),
+    storageKey: config.storageKey?.trim() || DEFAULT_DEDUPE_STORAGE_KEY,
+    ttlMs: normalizePositiveNumber(config.ttlMs, DEFAULT_DEDUPE_TTL_MS),
+    maxKeys: normalizePositiveNumber(config.maxKeys, DEFAULT_DEDUPE_MAX_KEYS),
+  };
+}
+
 function normalizeOptionalString(value?: string) {
   const normalized = value?.trim();
   return normalized || undefined;
@@ -365,6 +646,58 @@ function stripUndefined(value: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
   );
+}
+
+function createDefaultIdempotencyKey(decisionId: string, eventType: EngageEventType) {
+  return `datra:${eventType.toLowerCase()}:${decisionId}`;
+}
+
+function createEventDedupeKey(input: TrackEventInput) {
+  return input.idempotencyKey
+    ? `idempotency:${input.idempotencyKey}`
+    : `${input.eventType}:${input.decisionId}`;
+}
+
+function createQueueEventId() {
+  const cryptoApi = globalThis.crypto as Crypto | undefined;
+  if (cryptoApi?.randomUUID) {
+    return cryptoApi.randomUUID();
+  }
+
+  return `${Date.now()}:${Math.random().toString(36).slice(2)}`;
+}
+
+function isQueuedEngageEvent(value: unknown): value is QueuedEngageEvent {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const item = value as QueuedEngageEvent;
+  return (
+    typeof item.id === "string" &&
+    typeof item.createdAt === "string" &&
+    typeof item.attempts === "number" &&
+    Boolean(item.input) &&
+    typeof item.input.decisionId === "string" &&
+    typeof item.input.eventType === "string"
+  );
+}
+
+function trimDedupeEntries(entries: Record<string, number>, maxKeys: number) {
+  const sorted = Object.entries(entries).sort((left, right) => right[1] - left[1]);
+  return Object.fromEntries(sorted.slice(0, maxKeys));
+}
+
+function stringifyError(error: unknown) {
+  if (error instanceof DatraEngageError) {
+    return `${error.name}: ${error.message}`;
+  }
+
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}`;
+  }
+
+  return String(error);
 }
 
 function isRetryableError(error: unknown, retryStatuses: number[]) {
@@ -413,4 +746,97 @@ function resolveErrorMessage(body: unknown, status: number) {
 
 export function createDatraEngage(config: DatraEngageConfig) {
   return new DatraEngage(config);
+}
+
+export function createDatraEngageActionHandler(
+  handlers: DatraEngageActionHandlers,
+): DatraEngageActionHandler {
+  return async (action?: EngageAction | null, message?: EngageResolvedMessage) => {
+    if (!action || !action.type || action.type === "NONE") {
+      return;
+    }
+
+    const type = String(action.type).toUpperCase();
+    if (type === "OPEN_SCREEN" && action.screen) {
+      await handlers.onOpenScreen?.(String(action.screen), action, message);
+      return;
+    }
+
+    if (type === "OPEN_PROMOTION" && action.promotionId) {
+      await handlers.onOpenPromotion?.(String(action.promotionId), action, message);
+      return;
+    }
+
+    if (type === "OPEN_COUPON" && action.couponId) {
+      await handlers.onOpenCoupon?.(String(action.couponId), action, message);
+      return;
+    }
+
+    if (type === "OPEN_PRODUCT" && action.productId) {
+      await handlers.onOpenProduct?.(String(action.productId), action, message);
+      return;
+    }
+
+    if (type === "OPEN_CART") {
+      await handlers.onOpenCart?.(action, message);
+      return;
+    }
+
+    if (type === "OPEN_URL" && action.url) {
+      await handlers.onOpenUrl?.(String(action.url), action, message);
+      return;
+    }
+
+    if (type === "OPEN_STORY" && action.storyId) {
+      await handlers.onOpenStory?.(String(action.storyId), action, message);
+      return;
+    }
+
+    if (type === "OPEN_MECHANIC" && action.mechanicId) {
+      await handlers.onOpenMechanic?.(String(action.mechanicId), action, message);
+      return;
+    }
+
+    await handlers.onUnhandledAction?.(action, message);
+  };
+}
+
+export function createMemoryStorageAdapter(
+  initialValues: Record<string, string> = {},
+): DatraEngageStorage {
+  const values = new Map(Object.entries(initialValues));
+  return {
+    getItem(key) {
+      return values.get(key) ?? null;
+    },
+    setItem(key, value) {
+      values.set(key, value);
+    },
+    removeItem(key) {
+      values.delete(key);
+    },
+  };
+}
+
+export function createWebStorageAdapter(
+  storage: Pick<Storage, "getItem" | "setItem" | "removeItem"> | undefined =
+    typeof globalThis.localStorage !== "undefined" ? globalThis.localStorage : undefined,
+  keyPrefix = "",
+): DatraEngageStorage {
+  if (!storage) {
+    throw new Error("Web storage is not available in this runtime.");
+  }
+
+  const normalizeKey = (key: string) => `${keyPrefix}${key}`;
+  return {
+    getItem(key) {
+      return storage.getItem(normalizeKey(key));
+    },
+    setItem(key, value) {
+      storage.setItem(normalizeKey(key), value);
+    },
+    removeItem(key) {
+      storage.removeItem(normalizeKey(key));
+    },
+  };
 }
