@@ -83,6 +83,7 @@ export function useEngageMessages(
   const contextKey = stableStringify(context);
   const trackShownKey = stableStringify(trackShown);
   const mountedRef = React.useRef(false);
+  const requestIdRef = React.useRef(0);
   const [state, setState] = React.useState<{
     messages: EngageResolvedMessage[];
     response?: ResolveEngageMessagesResponse;
@@ -94,6 +95,7 @@ export function useEngageMessages(
   });
 
   const refresh = React.useCallback(async () => {
+    const requestId = ++requestIdRef.current;
     if (!enabled) {
       if (mountedRef.current) {
         setState((current) => ({
@@ -113,7 +115,7 @@ export function useEngageMessages(
     }
 
     try {
-      const response = await client.screenViewed(screen, {
+      const response = await client.screenViewedSafe(screen, {
         placement,
         customerExternalId,
         platform,
@@ -129,10 +131,10 @@ export function useEngageMessages(
           : {
               idempotencyKeyPrefix: placement ?? screen,
             };
-        await client.trackShown(response.messages, trackOptions);
+        void client.trackShown(response.messages, trackOptions).catch(() => undefined);
       }
 
-      if (mountedRef.current) {
+      if (mountedRef.current && requestId === requestIdRef.current) {
         setState({
           messages: response.messages,
           response,
@@ -141,7 +143,7 @@ export function useEngageMessages(
       }
       return response;
     } catch (error) {
-      if (mountedRef.current) {
+      if (mountedRef.current && requestId === requestIdRef.current) {
         setState({
           messages: [],
           isLoading: false,
@@ -170,6 +172,7 @@ export function useEngageMessages(
 
     return () => {
       mountedRef.current = false;
+      requestIdRef.current += 1;
     };
   }, [refresh]);
 

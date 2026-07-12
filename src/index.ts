@@ -3,6 +3,7 @@ export * from "./types.js";
 import type {
   DatraEngageConfig,
   DatraEngageDedupeConfig,
+  DatraEngageDiagnostics,
   DatraEngageIdentity,
   DatraEngageEventQueueConfig,
   DatraEngageRetryConfig,
@@ -25,7 +26,8 @@ import type {
   TrackEventOptions,
 } from "./types.js";
 
-const DEFAULT_TIMEOUT_MS = 5000;
+const DEFAULT_RESOLVE_TIMEOUT_MS = 750;
+const DEFAULT_EVENT_TIMEOUT_MS = 3000;
 const DEFAULT_RETRY_CONFIG: Required<DatraEngageRetryConfig> = {
   retries: 1,
   retryDelayMs: 250,
@@ -34,6 +36,7 @@ const DEFAULT_RETRY_CONFIG: Required<DatraEngageRetryConfig> = {
 };
 const DEFAULT_EVENT_QUEUE_STORAGE_KEY = "datra:engage:event-queue";
 const DEFAULT_EVENT_QUEUE_MAX_EVENTS = 100;
+const DEFAULT_EVENT_QUEUE_FLUSH_CONCURRENCY = 3;
 const DEFAULT_DEDUPE_STORAGE_KEY = "datra:engage:dedupe";
 const DEFAULT_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DEDUPE_MAX_KEYS = 500;
@@ -43,6 +46,7 @@ type NormalizedEventQueueConfig = {
   storage: DatraEngageStorage;
   storageKey: string;
   maxEvents: number;
+  flushConcurrency: number;
 };
 
 type NormalizedDedupeConfig = {
@@ -51,6 +55,12 @@ type NormalizedDedupeConfig = {
   storageKey: string;
   ttlMs: number;
   maxKeys: number;
+};
+
+type EngageRequestOptions = {
+  timeoutMs: number;
+  retryConfig: Required<DatraEngageRetryConfig>;
+  signal?: AbortSignal;
 };
 
 export class DatraEngageError extends Error {
@@ -70,12 +80,27 @@ export class DatraEngage {
   private readonly apiPrefix: string;
   private readonly publicKey: string;
   private readonly fetchImpl: EngageFetch;
-  private readonly timeoutMs: number;
-  private readonly retryConfig: Required<DatraEngageRetryConfig>;
+  private readonly resolveTimeoutMs: number;
+  private readonly eventTimeoutMs: number;
+  private readonly resolveRetryConfig: Required<DatraEngageRetryConfig>;
+  private readonly eventRetryConfig: Required<DatraEngageRetryConfig>;
   private readonly eventQueueConfig: NormalizedEventQueueConfig;
   private readonly dedupeConfig: NormalizedDedupeConfig;
   private readonly onError?: DatraEngageConfig["onError"];
   private readonly inFlightDedupeKeys = new Set<string>();
+  private readonly inFlightResolves = new Map<
+    string,
+    { signature: string; controller: AbortController; promise: Promise<ResolveEngageMessagesResponse> }
+  >();
+  private flushPromise?: Promise<FlushEngageEventQueueResult>;
+  private readonly diagnostics = {
+    resolveRequests: 0,
+    eventRequests: 0,
+    retries: 0,
+    timeouts: 0,
+    singleFlightHits: 0,
+    staleResolveCancellations: 0,
+  };
   private customerExternalId?: string;
   private platform?: string;
   private appVersion?: string;
@@ -99,8 +124,20 @@ export class DatraEngage {
     this.apiPrefix = normalizeApiPrefix(config.apiPrefix ?? "/api/v1");
     this.publicKey = config.publicKey.trim();
     this.fetchImpl = fetchImpl;
-    this.timeoutMs = normalizePositiveNumber(config.timeoutMs, DEFAULT_TIMEOUT_MS);
-    this.retryConfig = normalizeRetryConfig(config.retry);
+    this.resolveTimeoutMs = normalizePositiveNumber(
+      config.resolveTimeoutMs ?? config.timeoutMs,
+      DEFAULT_RESOLVE_TIMEOUT_MS,
+    );
+    this.eventTimeoutMs = normalizePositiveNumber(
+      config.eventTimeoutMs ?? config.timeoutMs,
+      DEFAULT_EVENT_TIMEOUT_MS,
+    );
+    this.resolveRetryConfig = normalizeRetryConfig(
+      config.resolveRetries ?? config.retry ?? 0,
+    );
+    this.eventRetryConfig = normalizeRetryConfig(
+      config.eventRetries ?? config.retry ?? 1,
+    );
     this.eventQueueConfig = normalizeEventQueueConfig(config.eventQueue);
     this.dedupeConfig = normalizeDedupeConfig(config.dedupe);
     this.onError = config.onError;
@@ -113,7 +150,9 @@ export class DatraEngage {
 
   identify(identity: DatraEngageIdentity) {
     if ("customerExternalId" in identity) {
-      this.customerExternalId = normalizeOptionalString(identity.customerExternalId);
+      const nextCustomerExternalId = normalizeOptionalString(identity.customerExternalId);
+      if (nextCustomerExternalId !== this.customerExternalId) this.cancelPendingResolves();
+      this.customerExternalId = nextCustomerExternalId;
     }
     if ("platform" in identity) {
       this.platform = normalizeOptionalString(identity.platform);
@@ -133,7 +172,9 @@ export class DatraEngage {
   }
 
   setCustomerExternalId(customerExternalId?: string) {
-    this.customerExternalId = normalizeOptionalString(customerExternalId);
+    const nextCustomerExternalId = normalizeOptionalString(customerExternalId);
+    if (nextCustomerExternalId !== this.customerExternalId) this.cancelPendingResolves();
+    this.customerExternalId = nextCustomerExternalId;
   }
 
   async screenViewed(screen: string, input: ScreenViewedInput = {}) {
@@ -150,12 +191,13 @@ export class DatraEngage {
   }
 
   async getMessages(input: ResolveMessagesInput): Promise<ResolveEngageMessagesResponse> {
+    this.diagnostics.resolveRequests += 1;
     const placement = input.placement.trim();
     if (!placement) {
       throw new Error("placement is required");
     }
 
-    return this.request<ResolveEngageMessagesResponse>("/engage/messages/resolve", {
+    const body = {
       customerExternalId: normalizeOptionalString(input.customerExternalId) ?? this.customerExternalId,
       placement,
       screen: normalizeOptionalString(input.screen),
@@ -164,19 +206,80 @@ export class DatraEngage {
       locale: normalizeOptionalString(input.locale) ?? this.locale,
       context: mergeContext(this.defaultContext, input.context),
       limit: input.limit,
+    };
+    const scope = [body.customerExternalId ?? "anonymous", placement, body.screen ?? "*"].join(":");
+    const signature = JSON.stringify(stripUndefined(body));
+    const existing = this.inFlightResolves.get(scope);
+    if (existing?.signature === signature) {
+      this.diagnostics.singleFlightHits += 1;
+      return existing.promise;
+    }
+    if (existing) {
+      this.diagnostics.staleResolveCancellations += 1;
+      existing.controller.abort();
+    }
+
+    const controller = new AbortController();
+    const detachSignal = forwardAbort(input.signal, controller);
+    const promise = this.request<ResolveEngageMessagesResponse>(
+      "/engage/messages/resolve",
+      body,
+      {
+        timeoutMs: this.resolveTimeoutMs,
+        retryConfig: this.resolveRetryConfig,
+        signal: controller.signal,
+      },
+    ).finally(() => {
+      detachSignal();
+      if (this.inFlightResolves.get(scope)?.promise === promise) {
+        this.inFlightResolves.delete(scope);
+      }
+    });
+    this.inFlightResolves.set(scope, { signature, controller, promise });
+    return promise;
+  }
+
+  async getMessagesSafe(input: ResolveMessagesInput): Promise<ResolveEngageMessagesResponse> {
+    try {
+      return await this.getMessages(input);
+    } catch {
+      return { messages: [] };
+    }
+  }
+
+  async screenViewedSafe(
+    screen: string,
+    input: ScreenViewedInput = {},
+  ): Promise<ResolveEngageMessagesResponse> {
+    const normalizedScreen = screen.trim();
+    if (!normalizedScreen) throw new Error("screen is required");
+    return this.getMessagesSafe({
+      ...input,
+      screen: normalizedScreen,
+      placement: input.placement ?? normalizedScreen,
     });
   }
 
+  cancelPendingResolves(): void {
+    for (const resolve of this.inFlightResolves.values()) resolve.controller.abort();
+    this.inFlightResolves.clear();
+  }
+
   async trackEvent(input: TrackEventInput): Promise<TrackEngageEventResponse> {
+    this.diagnostics.eventRequests += 1;
     const normalized = this.normalizeTrackEventInput(input);
 
-    return this.request<TrackEngageEventResponse>("/engage/events", {
-      decisionId: normalized.decisionId,
-      eventType: normalized.eventType,
-      customerExternalId: normalized.customerExternalId,
-      idempotencyKey: normalized.idempotencyKey,
-      metadata: normalized.metadata,
-    });
+    return this.request<TrackEngageEventResponse>(
+      "/engage/events",
+      {
+        decisionId: normalized.decisionId,
+        eventType: normalized.eventType,
+        customerExternalId: normalized.customerExternalId,
+        idempotencyKey: normalized.idempotencyKey,
+        metadata: normalized.metadata,
+      },
+      { timeoutMs: this.eventTimeoutMs, retryConfig: this.eventRetryConfig },
+    );
   }
 
   messageShown(decisionId: string, options?: TrackEventOptions) {
@@ -259,7 +362,15 @@ export class DatraEngage {
     return results;
   }
 
-  async flushEventQueue(): Promise<FlushEngageEventQueueResult> {
+  flushEventQueue(): Promise<FlushEngageEventQueueResult> {
+    if (this.flushPromise) return this.flushPromise;
+    this.flushPromise = this.flushEventQueueOnce().finally(() => {
+      this.flushPromise = undefined;
+    });
+    return this.flushPromise;
+  }
+
+  private async flushEventQueueOnce(): Promise<FlushEngageEventQueueResult> {
     if (!this.eventQueueConfig.enabled) {
       return {
         attempted: 0,
@@ -274,18 +385,28 @@ export class DatraEngage {
     let sent = 0;
     let failed = 0;
 
-    for (const item of queued) {
-      try {
-        await this.trackEvent(item.input);
-        await this.markDedupeKey(createEventDedupeKey(this.normalizeTrackEventInput(item.input)));
-        sent += 1;
-      } catch (error) {
+    for (let index = 0; index < queued.length; index += this.eventQueueConfig.flushConcurrency) {
+      const batch = queued.slice(index, index + this.eventQueueConfig.flushConcurrency);
+      const results = await Promise.all(batch.map(async (item) => {
+        try {
+          await this.trackEvent(item.input);
+          await this.markDedupeKey(createEventDedupeKey(this.normalizeTrackEventInput(item.input)));
+          return { sent: true as const };
+        } catch (error) {
+          return { sent: false as const, item, error };
+        }
+      }));
+      for (const result of results) {
+        if (result.sent) {
+          sent += 1;
+          continue;
+        }
         failed += 1;
-        if (isRetryableError(error, this.retryConfig.retryStatuses)) {
+        if (isRetryableError(result.error, this.eventRetryConfig.retryStatuses)) {
           remaining.push({
-            ...item,
-            attempts: item.attempts + 1,
-            lastError: stringifyError(error),
+            ...result.item,
+            attempts: result.item.attempts + 1,
+            lastError: stringifyError(result.error),
           });
         }
       }
@@ -316,6 +437,13 @@ export class DatraEngage {
     }
 
     await this.eventQueueConfig.storage.removeItem(this.eventQueueConfig.storageKey);
+  }
+
+  async getDiagnostics(): Promise<DatraEngageDiagnostics> {
+    return {
+      ...this.diagnostics,
+      queuedEvents: await this.getQueuedEventCount(),
+    };
   }
 
   private trackMessageEvent(
@@ -363,7 +491,7 @@ export class DatraEngage {
   }
 
   private async queueTrackEventIfRetryable(input: TrackEventInput, error: unknown) {
-    if (!this.eventQueueConfig.enabled || !isRetryableError(error, this.retryConfig.retryStatuses)) {
+    if (!this.eventQueueConfig.enabled || !isRetryableError(error, this.eventRetryConfig.retryStatuses)) {
       return false;
     }
 
@@ -478,16 +606,20 @@ export class DatraEngage {
     );
   }
 
-  private async request<T>(path: string, body: Record<string, unknown>): Promise<T> {
+  private async request<T>(
+    path: string,
+    body: Record<string, unknown>,
+    options: EngageRequestOptions,
+  ): Promise<T> {
     let lastError: unknown;
-    const maxAttempts = this.retryConfig.retries + 1;
+    const maxAttempts = options.retryConfig.retries + 1;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
-        return await this.sendOnce<T>(path, body);
+        return await this.sendOnce<T>(path, body, options);
       } catch (error) {
         lastError = error;
-        const retryable = isRetryableError(error, this.retryConfig.retryStatuses);
+        const retryable = isRetryableError(error, options.retryConfig.retryStatuses);
         this.onError?.(error, {
           path,
           attempt,
@@ -498,17 +630,27 @@ export class DatraEngage {
           throw error;
         }
 
-        await sleep(getRetryDelay(attempt, this.retryConfig));
+        this.diagnostics.retries += 1;
+        await sleep(getRetryDelay(attempt, options.retryConfig));
       }
     }
 
     throw lastError instanceof Error ? lastError : new Error("Datra Engage request failed");
   }
 
-  private async sendOnce<T>(path: string, body: Record<string, unknown>): Promise<T> {
+  private async sendOnce<T>(
+    path: string,
+    body: Record<string, unknown>,
+    options: EngageRequestOptions,
+  ): Promise<T> {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : undefined;
+    const detachSignal = controller ? forwardAbort(options.signal, controller) : () => undefined;
+    let timedOut = false;
     const timeout = controller
-      ? setTimeout(() => controller.abort(), this.timeoutMs)
+      ? setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, options.timeoutMs)
       : undefined;
 
     try {
@@ -534,9 +676,15 @@ export class DatraEngage {
       return responseBody as T;
     } catch (error) {
       if (isAbortError(error)) {
-        throw new DatraEngageError("Datra Engage request timed out", 0, {
-          code: "TIMEOUT",
-          timeoutMs: this.timeoutMs,
+        if (timedOut) {
+          this.diagnostics.timeouts += 1;
+          throw new DatraEngageError("Datra Engage request timed out", 0, {
+            code: "TIMEOUT",
+            timeoutMs: options.timeoutMs,
+          });
+        }
+        throw new DatraEngageError("Datra Engage request cancelled", 0, {
+          code: "ABORTED",
         });
       }
       throw error;
@@ -544,6 +692,7 @@ export class DatraEngage {
       if (timeout) {
         clearTimeout(timeout);
       }
+      detachSignal();
     }
   }
 
@@ -590,6 +739,7 @@ function normalizeEventQueueConfig(
       storage: createMemoryStorageAdapter(),
       storageKey: DEFAULT_EVENT_QUEUE_STORAGE_KEY,
       maxEvents: DEFAULT_EVENT_QUEUE_MAX_EVENTS,
+      flushConcurrency: DEFAULT_EVENT_QUEUE_FLUSH_CONCURRENCY,
     };
   }
 
@@ -599,6 +749,18 @@ function normalizeEventQueueConfig(
     storage: config.storage ?? createMemoryStorageAdapter(),
     storageKey: config.storageKey?.trim() || DEFAULT_EVENT_QUEUE_STORAGE_KEY,
     maxEvents: normalizePositiveNumber(config.maxEvents, DEFAULT_EVENT_QUEUE_MAX_EVENTS),
+    flushConcurrency: Math.max(
+      1,
+      Math.min(
+        Math.floor(
+          normalizePositiveNumber(
+            config.flushConcurrency,
+            DEFAULT_EVENT_QUEUE_FLUSH_CONCURRENCY,
+          ),
+        ),
+        20,
+      ),
+    ),
   };
 }
 
@@ -709,6 +871,17 @@ function isRetryableError(error: unknown, retryStatuses: number[]) {
 
 function isAbortError(error: unknown) {
   return error instanceof Error && error.name === "AbortError";
+}
+
+function forwardAbort(source: AbortSignal | undefined, target: AbortController) {
+  if (!source) return () => undefined;
+  const abort = () => target.abort();
+  if (source.aborted) {
+    target.abort();
+    return () => undefined;
+  }
+  source.addEventListener("abort", abort, { once: true });
+  return () => source.removeEventListener("abort", abort);
 }
 
 function getRetryDelay(attempt: number, config: Required<DatraEngageRetryConfig>) {

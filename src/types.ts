@@ -110,6 +110,7 @@ export interface TrackEngageEventResponse {
   decisionId: string;
   eventType: EngageEventType;
   accepted: boolean;
+  queued?: boolean;
 }
 
 export type EngageFetch = (
@@ -141,6 +142,7 @@ export interface DatraEngageEventQueueConfig {
   storage?: DatraEngageStorage;
   storageKey?: string;
   maxEvents?: number;
+  flushConcurrency?: number;
 }
 
 export interface DatraEngageDedupeConfig {
@@ -163,6 +165,10 @@ export interface DatraEngageConfig {
   fetchImpl?: EngageFetch;
   timeoutMs?: number;
   retry?: DatraEngageRetryConfig | number;
+  resolveTimeoutMs?: number;
+  eventTimeoutMs?: number;
+  resolveRetries?: number;
+  eventRetries?: number;
   eventQueue?: boolean | DatraEngageEventQueueConfig;
   dedupe?: boolean | DatraEngageDedupeConfig;
   onError?: (error: unknown, context: DatraEngageErrorContext) => void;
@@ -185,6 +191,7 @@ export interface ResolveMessagesInput {
   locale?: string;
   context?: Record<string, unknown>;
   limit?: number;
+  signal?: AbortSignal;
 }
 
 export interface ScreenViewedInput {
@@ -195,6 +202,7 @@ export interface ScreenViewedInput {
   locale?: string;
   context?: Record<string, unknown>;
   limit?: number;
+  signal?: AbortSignal;
 }
 
 export interface TrackEventInput {
@@ -238,4 +246,14 @@ export interface FlushEngageEventQueueResult {
   sent: number;
   failed: number;
   remaining: number;
+}
+
+export interface DatraEngageDiagnostics {
+  resolveRequests: number;
+  eventRequests: number;
+  retries: number;
+  timeouts: number;
+  singleFlightHits: number;
+  staleResolveCancellations: number;
+  queuedEvents: number;
 }

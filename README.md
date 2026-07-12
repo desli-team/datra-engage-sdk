@@ -506,18 +506,17 @@ try {
 
 ## Timeout and Retry
 
-Requests time out after 5 seconds by default and retry once on temporary failures.
+Resolve requests fail open quickly in mobile apps: the default resolve timeout is 750 ms with no
+retry. Event tracking uses a 3 second timeout, retries once, and can be persisted in the event queue.
 
 ```ts
 const engage = new DatraEngage({
   baseUrl: "https://api.datra.uz",
   publicKey: "pk_live_xxx",
-  timeoutMs: 3000,
-  retry: {
-    retries: 2,
-    retryDelayMs: 200,
-    maxRetryDelayMs: 1000,
-  },
+  resolveTimeoutMs: 750,
+  eventTimeoutMs: 3000,
+  resolveRetries: 0,
+  eventRetries: 1,
   onError: (error, context) => {
     console.warn("Datra Engage request failed", {
       path: context.path,
@@ -528,6 +527,13 @@ const engage = new DatraEngage({
   },
 });
 ```
+
+Use `screenViewedSafe` or `getMessagesSafe` when Engage must never block the host application.
+Identical concurrent resolve calls are coalesced automatically, and a newer request for the same
+customer/placement cancels an older stale request.
+
+`await engage.getDiagnostics()` returns aggregate resolve/event/retry/timeout/single-flight and
+queued-event counters without customer identifiers or public keys.
 
 Disable retries:
 
