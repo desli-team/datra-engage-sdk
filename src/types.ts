@@ -248,6 +248,20 @@ export interface FlushEngageEventQueueResult {
   remaining: number;
 }
 
+export interface DatraEngagePlacementDiagnostics {
+  resolveCalls: number;
+  networkRequests: number;
+  successfulRequests: number;
+  emptyResponses: number;
+  timeouts: number;
+  errors: number;
+  cancellations: number;
+  singleFlightHits: number;
+  averageDurationMs: number;
+  lastDurationMs: number;
+  maxDurationMs: number;
+}
+
 export interface DatraEngageDiagnostics {
   resolveRequests: number;
   eventRequests: number;
@@ -256,4 +270,5 @@ export interface DatraEngageDiagnostics {
   singleFlightHits: number;
   staleResolveCancellations: number;
   queuedEvents: number;
+  placements: Record<string, DatraEngagePlacementDiagnostics>;
 }

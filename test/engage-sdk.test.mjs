@@ -83,6 +83,42 @@ test("screenViewed uses screen as default placement", async () => {
   assert.equal(bodies[0].placement, "checkout");
 });
 
+test("resolve uses the 2000 ms default timeout", async () => {
+  const nativeSetTimeout = globalThis.setTimeout;
+  let scheduledTimeoutMs;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    scheduledTimeoutMs = delay;
+    return nativeSetTimeout(callback, 0, ...args);
+  };
+
+  try {
+    const sdk = new DatraEngage({
+      baseUrl: "https://api.datra.uz",
+      publicKey: "pk_live_test",
+      fetchImpl: async (_url, init) =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
+        }),
+    });
+
+    await assert.rejects(
+      () => sdk.getMessages({ placement: "home_top_banner" }),
+      (error) => {
+        assert.equal(error instanceof DatraEngageError, true);
+        assert.deepEqual(error.body, { code: "TIMEOUT", timeoutMs: 2000 });
+        return true;
+      },
+    );
+    assert.equal(scheduledTimeoutMs, 2000);
+  } finally {
+    globalThis.setTimeout = nativeSetTimeout;
+  }
+});
+
 test("safe resolve fails open and uses the dedicated resolve timeout", async () => {
   const errors = [];
   const sdk = new DatraEngage({
@@ -107,7 +143,10 @@ test("safe resolve fails open and uses the dedicated resolve timeout", async () 
   assert.equal(errors.length, 1);
   assert.equal(errors[0].context.path, "/engage/messages/resolve");
   assert.deepEqual(errors[0].error.body, { code: "TIMEOUT", timeoutMs: 1 });
-  assert.equal((await sdk.getDiagnostics()).timeouts, 1);
+  const diagnostics = await sdk.getDiagnostics();
+  assert.equal(diagnostics.timeouts, 1);
+  assert.equal(diagnostics.placements.home.timeouts, 1);
+  assert.equal(diagnostics.placements.home.networkRequests, 1);
 });
 
 test("identical concurrent resolves use one in-flight request", async () => {
@@ -130,7 +169,11 @@ test("identical concurrent resolves use one in-flight request", async () => {
 
   await Promise.all([first, second]);
   assert.equal(calls, 1);
-  assert.equal((await sdk.getDiagnostics()).singleFlightHits, 1);
+  const diagnostics = await sdk.getDiagnostics();
+  assert.equal(diagnostics.singleFlightHits, 1);
+  assert.equal(diagnostics.placements.home.resolveCalls, 2);
+  assert.equal(diagnostics.placements.home.networkRequests, 1);
+  assert.equal(diagnostics.placements.home.singleFlightHits, 1);
 });
 
 test("a newer resolve cancels a stale request for the same placement", async () => {
@@ -168,7 +211,60 @@ test("a newer resolve cancels a stale request for the same placement", async () 
   await assert.rejects(stale, (error) => error instanceof DatraEngageError && error.status === 0);
   assert.deepEqual(await current, { messages: [] });
   assert.equal(calls, 2);
-  assert.equal((await sdk.getDiagnostics()).staleResolveCancellations, 1);
+  const diagnostics = await sdk.getDiagnostics();
+  assert.equal(diagnostics.staleResolveCancellations, 1);
+  assert.equal(diagnostics.placements.home.cancellations, 1);
+  assert.equal(diagnostics.placements.home.successfulRequests, 1);
+});
+
+test("collects independent diagnostics for concurrent placements", async () => {
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      return createJsonResponse({
+        messages: body.placement === "home_popup" ? [{ decisionId: "popup" }] : [],
+      });
+    },
+  });
+
+  await Promise.all([
+    sdk.getMessagesSafe({ placement: "home_top_banner", screen: "home" }),
+    sdk.getMessagesSafe({ placement: "home_top_banner_purple", screen: "home" }),
+    sdk.getMessagesSafe({ placement: "home_popup", screen: "home" }),
+  ]);
+
+  const diagnostics = await sdk.getDiagnostics();
+  assert.deepEqual(Object.keys(diagnostics.placements).sort(), [
+    "home_popup",
+    "home_top_banner",
+    "home_top_banner_purple",
+  ]);
+  assert.equal(diagnostics.placements.home_top_banner.networkRequests, 1);
+  assert.equal(diagnostics.placements.home_top_banner.emptyResponses, 1);
+  assert.equal(diagnostics.placements.home_top_banner_purple.successfulRequests, 1);
+  assert.equal(diagnostics.placements.home_popup.successfulRequests, 1);
+  assert.equal(diagnostics.placements.home_popup.emptyResponses, 0);
+});
+
+test("bounds placement diagnostics cardinality", async () => {
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    fetchImpl: async () => createJsonResponse({ messages: [] }),
+  });
+
+  await Promise.all(
+    Array.from({ length: 102 }, (_, index) =>
+      sdk.getMessages({ placement: `placement_${index}` }),
+    ),
+  );
+
+  const diagnostics = await sdk.getDiagnostics();
+  assert.equal(Object.keys(diagnostics.placements).length, 101);
+  assert.equal(diagnostics.placements.__other__.resolveCalls, 2);
+  assert.equal(diagnostics.placements.__other__.networkRequests, 2);
 });
 
 test("resolve does not retry by default while events retry once", async () => {

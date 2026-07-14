@@ -9,6 +9,7 @@ const engage = new DatraEngage({
   platform: "ios",
   appVersion: "1.5.0",
   locale: "ru",
+  resolveTimeoutMs: 2000,
   eventQueue: true,
 });
 

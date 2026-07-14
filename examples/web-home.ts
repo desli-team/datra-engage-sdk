@@ -11,6 +11,7 @@ const engage = new DatraEngage({
   platform: "web",
   appVersion: "1.5.0",
   locale: "ru",
+  resolveTimeoutMs: 2000,
   eventQueue: {
     enabled: true,
     storage: createWebStorageAdapter(window.localStorage, "hoty-dogy:"),

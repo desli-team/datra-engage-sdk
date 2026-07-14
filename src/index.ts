@@ -4,6 +4,7 @@ import type {
   DatraEngageConfig,
   DatraEngageDedupeConfig,
   DatraEngageDiagnostics,
+  DatraEngagePlacementDiagnostics,
   DatraEngageIdentity,
   DatraEngageEventQueueConfig,
   DatraEngageRetryConfig,
@@ -26,7 +27,7 @@ import type {
   TrackEventOptions,
 } from "./types.js";
 
-const DEFAULT_RESOLVE_TIMEOUT_MS = 750;
+const DEFAULT_RESOLVE_TIMEOUT_MS = 2000;
 const DEFAULT_EVENT_TIMEOUT_MS = 3000;
 const DEFAULT_RETRY_CONFIG: Required<DatraEngageRetryConfig> = {
   retries: 1,
@@ -40,6 +41,8 @@ const DEFAULT_EVENT_QUEUE_FLUSH_CONCURRENCY = 3;
 const DEFAULT_DEDUPE_STORAGE_KEY = "datra:engage:dedupe";
 const DEFAULT_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DEDUPE_MAX_KEYS = 500;
+const MAX_PLACEMENT_DIAGNOSTICS = 100;
+const OTHER_PLACEMENT_DIAGNOSTICS_KEY = "__other__";
 
 type NormalizedEventQueueConfig = {
   enabled: boolean;
@@ -61,6 +64,14 @@ type EngageRequestOptions = {
   timeoutMs: number;
   retryConfig: Required<DatraEngageRetryConfig>;
   signal?: AbortSignal;
+};
+
+type MutablePlacementDiagnostics = Omit<
+  DatraEngagePlacementDiagnostics,
+  "averageDurationMs"
+> & {
+  completedRequests: number;
+  totalDurationMs: number;
 };
 
 export class DatraEngageError extends Error {
@@ -101,6 +112,7 @@ export class DatraEngage {
     singleFlightHits: 0,
     staleResolveCancellations: 0,
   };
+  private readonly placementDiagnostics = new Map<string, MutablePlacementDiagnostics>();
   private customerExternalId?: string;
   private platform?: string;
   private appVersion?: string;
@@ -196,6 +208,8 @@ export class DatraEngage {
     if (!placement) {
       throw new Error("placement is required");
     }
+    const placementDiagnostics = this.getPlacementDiagnostics(placement);
+    placementDiagnostics.resolveCalls += 1;
 
     const body = {
       customerExternalId: normalizeOptionalString(input.customerExternalId) ?? this.customerExternalId,
@@ -212,6 +226,7 @@ export class DatraEngage {
     const existing = this.inFlightResolves.get(scope);
     if (existing?.signature === signature) {
       this.diagnostics.singleFlightHits += 1;
+      placementDiagnostics.singleFlightHits += 1;
       return existing.promise;
     }
     if (existing) {
@@ -221,6 +236,8 @@ export class DatraEngage {
 
     const controller = new AbortController();
     const detachSignal = forwardAbort(input.signal, controller);
+    const startedAt = Date.now();
+    placementDiagnostics.networkRequests += 1;
     const promise = this.request<ResolveEngageMessagesResponse>(
       "/engage/messages/resolve",
       body,
@@ -229,12 +246,39 @@ export class DatraEngage {
         retryConfig: this.resolveRetryConfig,
         signal: controller.signal,
       },
-    ).finally(() => {
-      detachSignal();
-      if (this.inFlightResolves.get(scope)?.promise === promise) {
-        this.inFlightResolves.delete(scope);
-      }
-    });
+    )
+      .then((response) => {
+        placementDiagnostics.successfulRequests += 1;
+        if (response.messages.length === 0) {
+          placementDiagnostics.emptyResponses += 1;
+        }
+        return response;
+      })
+      .catch((error: unknown) => {
+        const errorCode = getDatraEngageErrorCode(error);
+        if (errorCode === "TIMEOUT") {
+          placementDiagnostics.timeouts += 1;
+        } else if (errorCode === "ABORTED") {
+          placementDiagnostics.cancellations += 1;
+        } else {
+          placementDiagnostics.errors += 1;
+        }
+        throw error;
+      })
+      .finally(() => {
+        const durationMs = Math.max(0, Date.now() - startedAt);
+        placementDiagnostics.completedRequests += 1;
+        placementDiagnostics.totalDurationMs += durationMs;
+        placementDiagnostics.lastDurationMs = durationMs;
+        placementDiagnostics.maxDurationMs = Math.max(
+          placementDiagnostics.maxDurationMs,
+          durationMs,
+        );
+        detachSignal();
+        if (this.inFlightResolves.get(scope)?.promise === promise) {
+          this.inFlightResolves.delete(scope);
+        }
+      });
     this.inFlightResolves.set(scope, { signature, controller, promise });
     return promise;
   }
@@ -440,10 +484,66 @@ export class DatraEngage {
   }
 
   async getDiagnostics(): Promise<DatraEngageDiagnostics> {
+    const placements = Object.fromEntries(
+      Array.from(this.placementDiagnostics.entries()).map(([placement, diagnostics]) => [
+        placement,
+        {
+          resolveCalls: diagnostics.resolveCalls,
+          networkRequests: diagnostics.networkRequests,
+          successfulRequests: diagnostics.successfulRequests,
+          emptyResponses: diagnostics.emptyResponses,
+          timeouts: diagnostics.timeouts,
+          errors: diagnostics.errors,
+          cancellations: diagnostics.cancellations,
+          singleFlightHits: diagnostics.singleFlightHits,
+          averageDurationMs:
+            diagnostics.completedRequests > 0
+              ? Math.round(diagnostics.totalDurationMs / diagnostics.completedRequests)
+              : 0,
+          lastDurationMs: diagnostics.lastDurationMs,
+          maxDurationMs: diagnostics.maxDurationMs,
+        },
+      ]),
+    );
+
     return {
       ...this.diagnostics,
       queuedEvents: await this.getQueuedEventCount(),
+      placements,
     };
+  }
+
+  private getPlacementDiagnostics(placement: string): MutablePlacementDiagnostics {
+    const existing = this.placementDiagnostics.get(placement);
+    if (existing) {
+      return existing;
+    }
+
+    const diagnosticsKey =
+      this.placementDiagnostics.size < MAX_PLACEMENT_DIAGNOSTICS
+        ? placement
+        : OTHER_PLACEMENT_DIAGNOSTICS_KEY;
+    const overflowDiagnostics = this.placementDiagnostics.get(diagnosticsKey);
+    if (overflowDiagnostics) {
+      return overflowDiagnostics;
+    }
+
+    const diagnostics: MutablePlacementDiagnostics = {
+      resolveCalls: 0,
+      networkRequests: 0,
+      successfulRequests: 0,
+      emptyResponses: 0,
+      timeouts: 0,
+      errors: 0,
+      cancellations: 0,
+      singleFlightHits: 0,
+      completedRequests: 0,
+      totalDurationMs: 0,
+      lastDurationMs: 0,
+      maxDurationMs: 0,
+    };
+    this.placementDiagnostics.set(diagnosticsKey, diagnostics);
+    return diagnostics;
   }
 
   private trackMessageEvent(
@@ -871,6 +971,17 @@ function isRetryableError(error: unknown, retryStatuses: number[]) {
 
 function isAbortError(error: unknown) {
   return error instanceof Error && error.name === "AbortError";
+}
+
+function getDatraEngageErrorCode(error: unknown): string | undefined {
+  if (!(error instanceof DatraEngageError)) {
+    return undefined;
+  }
+  if (!error.body || typeof error.body !== "object" || Array.isArray(error.body)) {
+    return undefined;
+  }
+  const code = (error.body as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
 }
 
 function forwardAbort(source: AbortSignal | undefined, target: AbortController) {

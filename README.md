@@ -130,6 +130,7 @@ const engage = new DatraEngage({
   platform: "ios",
   appVersion: "1.5.0",
   locale: "ru",
+  resolveTimeoutMs: 2000,
   defaultContext: {
     branchExternalId: "branch_1",
   },
@@ -404,6 +405,7 @@ const engage = new DatraEngage({
   publicKey: "pk_live_xxx",
   platform: "ios",
   appVersion: "1.5.0",
+  resolveTimeoutMs: 2000,
 });
 
 export function App() {
@@ -506,14 +508,14 @@ try {
 
 ## Timeout and Retry
 
-Resolve requests fail open quickly in mobile apps: the default resolve timeout is 750 ms with no
+Resolve requests fail open in mobile apps: the default resolve timeout is 2000 ms with no
 retry. Event tracking uses a 3 second timeout, retries once, and can be persisted in the event queue.
 
 ```ts
 const engage = new DatraEngage({
   baseUrl: "https://api.datra.uz",
   publicKey: "pk_live_xxx",
-  resolveTimeoutMs: 750,
+  resolveTimeoutMs: 2000,
   eventTimeoutMs: 3000,
   resolveRetries: 0,
   eventRetries: 1,
@@ -533,7 +535,14 @@ Identical concurrent resolve calls are coalesced automatically, and a newer requ
 customer/placement cancels an older stale request.
 
 `await engage.getDiagnostics()` returns aggregate resolve/event/retry/timeout/single-flight and
-queued-event counters without customer identifiers or public keys.
+queued-event counters plus per-placement resolve calls, network requests, outcomes and latency.
+Diagnostics never include customer identifiers or public keys and are capped at 100 placement keys;
+additional keys are aggregated under `__other__`.
+
+```ts
+const diagnostics = await engage.getDiagnostics();
+console.log(diagnostics.placements.home_top_banner);
+```
 
 Disable retries:
 
