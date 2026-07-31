@@ -176,6 +176,70 @@ test("identical concurrent resolves use one in-flight request", async () => {
   assert.equal(diagnostics.placements.home.singleFlightHits, 1);
 });
 
+test("equivalent context maps share one in-flight resolve regardless of key order", async () => {
+  let calls = 0;
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    fetchImpl: async () => {
+      calls += 1;
+      await pending;
+      return createJsonResponse({ messages: [] });
+    },
+  });
+
+  const first = sdk.getMessages({
+    placement: "home",
+    customerExternalId: "customer_1",
+    context: { branchId: "branch_1", cart: { total: 100, items: 2 } },
+  });
+  const second = sdk.getMessages({
+    placement: "home",
+    customerExternalId: "customer_1",
+    context: { cart: { items: 2, total: 100 }, branchId: "branch_1" },
+  });
+  release();
+
+  await Promise.all([first, second]);
+  assert.equal(calls, 1);
+});
+
+test("a caller abort does not cancel an identical shared resolve", async () => {
+  let calls = 0;
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const controller = new AbortController();
+  const sdk = new DatraEngage({
+    baseUrl: "https://api.datra.uz",
+    publicKey: "pk_live_test",
+    fetchImpl: async () => {
+      calls += 1;
+      await pending;
+      return createJsonResponse({ messages: [] });
+    },
+  });
+
+  const cancelled = sdk.getMessages({
+    placement: "home",
+    customerExternalId: "customer_1",
+    signal: controller.signal,
+  });
+  const shared = sdk.getMessages({
+    placement: "home",
+    customerExternalId: "customer_1",
+  });
+  controller.abort();
+  await assert.rejects(
+    cancelled,
+    (error) => error instanceof DatraEngageError && error.body.code === "ABORTED",
+  );
+  release();
+  await shared;
+  assert.equal(calls, 1);
+});
+
 test("a newer resolve cancels a stale request for the same placement", async () => {
   let calls = 0;
   const sdk = new DatraEngage({

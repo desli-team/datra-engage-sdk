@@ -1,6 +1,6 @@
 {
   "name": "@datra/engage-sdk",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Official JavaScript and TypeScript SDK for Datra Engage in-app messages, promotions, coupons, and customer engagement tracking.",
   "type": "module",
   "main": "./dist/index.js",

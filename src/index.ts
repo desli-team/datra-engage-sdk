@@ -222,12 +222,15 @@ export class DatraEngage {
       limit: input.limit,
     };
     const scope = [body.customerExternalId ?? "anonymous", placement, body.screen ?? "*"].join(":");
-    const signature = JSON.stringify(stripUndefined(body));
+    // Object insertion order must not turn the same eligibility context into
+    // competing network requests. This is common when a screen rebuilds its
+    // context from independent state sources.
+    const signature = stableStringify(stripUndefined(body));
     const existing = this.inFlightResolves.get(scope);
     if (existing?.signature === signature) {
       this.diagnostics.singleFlightHits += 1;
       placementDiagnostics.singleFlightHits += 1;
-      return existing.promise;
+      return awaitWithCallerAbort(existing.promise, input.signal);
     }
     if (existing) {
       this.diagnostics.staleResolveCancellations += 1;
@@ -235,7 +238,6 @@ export class DatraEngage {
     }
 
     const controller = new AbortController();
-    const detachSignal = forwardAbort(input.signal, controller);
     const startedAt = Date.now();
     placementDiagnostics.networkRequests += 1;
     const promise = this.request<ResolveEngageMessagesResponse>(
@@ -274,13 +276,15 @@ export class DatraEngage {
           placementDiagnostics.maxDurationMs,
           durationMs,
         );
-        detachSignal();
         if (this.inFlightResolves.get(scope)?.promise === promise) {
           this.inFlightResolves.delete(scope);
         }
       });
     this.inFlightResolves.set(scope, { signature, controller, promise });
-    return promise;
+    // A component unmounting must not cancel the shared request for another
+    // component rendering the same placement. Stale *payloads* still cancel
+    // the underlying request above.
+    return awaitWithCallerAbort(promise, input.signal);
   }
 
   async getMessagesSafe(input: ResolveMessagesInput): Promise<ResolveEngageMessagesResponse> {
@@ -964,9 +968,42 @@ function stringifyError(error: unknown) {
 
 function isRetryableError(error: unknown, retryStatuses: number[]) {
   if (error instanceof DatraEngageError) {
-    return error.status === 0 || retryStatuses.includes(error.status);
+    return getDatraEngageErrorCode(error) !== "ABORTED" &&
+      (error.status === 0 || retryStatuses.includes(error.status));
   }
   return true;
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entryValue]) => entryValue !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, entryValue]) =>
+      `${JSON.stringify(key)}:${stableStringify(entryValue)}`,
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function awaitWithCallerAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(createCallerAbortError());
+
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(createCallerAbortError());
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+function createCallerAbortError() {
+  return new DatraEngageError("Datra Engage request cancelled", 0, {
+    code: "ABORTED",
+  });
 }
 
 function isAbortError(error: unknown) {
