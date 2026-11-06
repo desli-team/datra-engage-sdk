@@ -169,6 +169,8 @@ export interface DatraEngageConfig {
   eventTimeoutMs?: number;
   resolveRetries?: number;
   eventRetries?: number;
+  /** Timeout for `getLoyaltyQr`. Defaults to 5000 ms. Loyalty QR requests are never retried. */
+  loyaltyQrTimeoutMs?: number;
   eventQueue?: boolean | DatraEngageEventQueueConfig;
   dedupe?: boolean | DatraEngageDedupeConfig;
   onError?: (error: unknown, context: DatraEngageErrorContext) => void;
@@ -271,4 +273,60 @@ export interface DatraEngageDiagnostics {
   staleResolveCancellations: number;
   queuedEvents: number;
   placements: Record<string, DatraEngagePlacementDiagnostics>;
+}
+
+export type LoyaltyQrIntent = "EARN" | "SPEND";
+
+export type LoyaltyQrPlatform = "ios" | "android" | "web";
+
+export interface GetLoyaltyQrInput {
+  /** The same external ID the brand sends to Datra for this customer (1..255 characters). */
+  customerExternalId: string;
+  /** Defaults to `EARN`. */
+  intent?: LoyaltyQrIntent;
+  /** Positive integer, only together with `intent: "SPEND"`. */
+  maxSpendPoints?: number;
+  /** Risk signal only. Longer values are cut to 128 characters. */
+  deviceId?: string;
+  /** Defaults to the client's `appVersion`. Longer values are cut to 32 characters. */
+  appVersion?: string;
+  /** Defaults to the client's `platform` when it is one of `ios`, `android`, `web`. */
+  platform?: LoyaltyQrPlatform;
+  signal?: AbortSignal;
+}
+
+/**
+ * A one-time loyalty QR token. `qr` is a bearer secret: render it, never log, persist,
+ * cache or send it to analytics or crash reporting.
+ */
+export interface LoyaltyQr {
+  qr: string;
+  expiresAt: Date;
+  refreshAfterSec: number;
+}
+
+export interface LoyaltyQrSessionState {
+  /** The token to render, or undefined while loading, idle-expired, unavailable or failed. */
+  qr?: LoyaltyQr;
+  isLoading: boolean;
+  /** True after `idleTimeoutMs` without `refresh()` / `touch()`: auto-refresh stopped, ask the guest to tap. */
+  expired: boolean;
+  /** True after a 404: the feature is off for this tenant or key. Auto-refresh stops. */
+  unavailable: boolean;
+  error?: unknown;
+  /** Seconds until the next request is allowed after a 429, otherwise undefined. */
+  retryAfterSec?: number;
+}
+
+export interface LoyaltyQrSessionOptions {
+  /** Stop auto-refresh after this long without interaction. Defaults to 180000 ms (3 minutes). */
+  idleTimeoutMs?: number;
+  /** Delay before retrying a transient failure (timeout, network, 5xx). Defaults to 15000 ms. */
+  errorRetryDelayMs?: number;
+  /** Called on every state change. */
+  onChange?: (state: LoyaltyQrSessionState) => void;
+  /** Test seams. */
+  now?: () => number;
+  setTimer?: (callback: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
 }
