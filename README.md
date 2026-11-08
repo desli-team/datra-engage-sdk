@@ -88,6 +88,7 @@ The SDK can:
 - retry temporary failed requests
 - queue failed tracking events
 - deduplicate UI tracking events
+- fetch a one-time loyalty QR for the guest to show at the till
 
 ---
 
@@ -556,6 +557,68 @@ const engage = new DatraEngage({
 
 ---
 
+## Loyalty QR
+
+`getLoyaltyQr` asks Datra for a one-time QR token that the guest shows to the cashier. The cashier scans it at
+the register, the guest is attached to the order and earns points as with a phone lookup. The QR carries no
+personal data; Datra only issues it when loyalty QR is switched on for the tenant and the app key.
+
+```ts
+import { LoyaltyQrRateLimitError, LoyaltyQrUnavailableError } from "@datra/engage-sdk";
+
+try {
+  const { qr, expiresAt, refreshAfterSec } = await engage.getLoyaltyQr({
+    customerExternalId: user.id, // the same external ID your backend sends to Datra
+    intent: "EARN", // default; "SPEND" with maxSpendPoints is reserved for spending
+    deviceId, // optional risk signal, max 128 characters
+    platform: "ios", // optional: "ios" | "android" | "web", defaults to the client platform
+  });
+  renderQr(qr); // e.g. react-native-qrcode-svg
+  // ask again after refreshAfterSec seconds; the token lives about a minute
+} catch (error) {
+  if (error instanceof LoyaltyQrUnavailableError) hideQrEntryPoint(); // 404: feature off
+  else if (error instanceof LoyaltyQrRateLimitError) wait(error.retryAfterSec); // 429
+  else showRetry();
+}
+```
+
+- The response is validated strictly: `qr` must match `dq1_` + 64 lowercase hex, `refreshAfterSec` must be a
+  positive integer and `expiresAt` a valid date (returned as a `Date`). Anything else rejects with
+  `LoyaltyQrResponseError`, which does not carry the body.
+- The request is sent once with a 5 second timeout (`loyaltyQrTimeoutMs`) and is never retried, whatever the
+  global `retry` settings: Datra allows 6 QR requests per minute per customer. Identical concurrent calls share
+  one request. After a 429 the SDK rejects further calls for that customer locally until `Retry-After` passes.
+- Issuing a new token invalidates the previous one within 5 seconds, so keep one QR on screen at a time.
+- **The token is a bearer secret.** The SDK never caches, persists or logs it. Do the same: keep it in component
+  state only, never write it to storage, logs, analytics, crash reports or navigation params.
+
+### Keeping the QR fresh
+
+`createLoyaltyQrSession(engage, input, options)` (framework-agnostic) and `useLoyaltyQr(input, options)` from
+`@datra/engage-sdk/react` keep one QR fresh while it is visible:
+
+- fetch on `start()` / when `active` becomes true, then again after `refreshAfterSec`;
+- drop the token and all timers on `stop()` / when `active` becomes false (screen blurred, app backgrounded);
+- after `idleTimeoutMs` (default 3 minutes) without `refresh()` or `touch()`, stop and set `expired` — show
+  «tap to refresh» and call `refresh()`;
+- on 404 set `unavailable` and stop; on 429 wait `Retry-After`; on a timeout, network error or 5xx retry once
+  after `errorRetryDelayMs` (default 15 s); other errors wait for `refresh()`.
+
+```tsx
+import { useLoyaltyQr } from "@datra/engage-sdk/react";
+
+const isFocused = useIsFocused();
+const appActive = useAppState() === "active";
+const { qr, isLoading, expired, unavailable, error, refresh, touch } = useLoyaltyQr(
+  user ? { customerExternalId: user.id, deviceId } : null,
+  { client: engage, active: isFocused && appActive },
+);
+```
+
+`client` defaults to the `DatraEngageProvider` client.
+
+---
+
 ## API Contract
 
 The SDK calls:
@@ -563,6 +626,7 @@ The SDK calls:
 ```http
 POST /api/v1/engage/messages/resolve
 POST /api/v1/engage/events
+POST /api/v1/engage/loyalty/qr
 ```
 
 Authorization uses the public SDK key:
